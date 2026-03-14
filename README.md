@@ -1,6 +1,6 @@
 # Prediction Market Signal Pipeline
 
-A modular pipeline that ingests real-time prediction market data, normalizes it into exchange-agnostic schemas, and generates structured market insights using an LLM.
+A modular pipeline that ingests real-time prediction market data, normalizes it into exchange-agnostic schemas, and generates structured market insights using an LLM. (Product Spec: https://docs.google.com/document/d/1eY5DGsbhrDkuc8TmscHgT2lWwK0A5nb7/edit?usp=sharing&ouid=111548385051032362807&rtpof=true&sd=true)
 
 ---
 
