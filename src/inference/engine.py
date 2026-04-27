@@ -8,7 +8,7 @@ InferenceReport with mispricings and quarter-Kelly position sizes.
 
 import json
 
-from groq import Groq
+from openai import OpenAI
 
 from src.context.models import ContextMarket
 from src.inference.models import (
@@ -22,7 +22,7 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_GROQ_MODEL = "llama-3.3-70b-versatile"
+_MODEL = "gpt-4o"
 
 _SYSTEM_PROMPT = """\
 You are a quantitative prediction market analyst specialising in cross-market inference.
@@ -141,7 +141,7 @@ def run_inference(
     Returns a fully populated InferenceReport with quarter-Kelly position sizes.
     Falls back to single-market analysis when context is empty.
     """
-    client = Groq()
+    client = OpenAI()
 
     prompt = _USER_TEMPLATE.format(
         ticker=snapshot.market,
@@ -161,7 +161,7 @@ def run_inference(
     )
 
     response = client.chat.completions.create(
-        model=_GROQ_MODEL,
+        model=_MODEL,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": prompt},

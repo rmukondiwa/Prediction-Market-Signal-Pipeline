@@ -12,7 +12,7 @@ the LLM's positional bias toward items listed first.
 import json
 import random
 
-from groq import Groq
+from openai import OpenAI
 
 from src.catalog.models import CatalogMarket
 from src.context.models import CandidateMarket, ContextMarket
@@ -20,7 +20,7 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_GROQ_MODEL = "llama-3.3-70b-versatile"
+_MODEL = "gpt-4o-mini"
 
 _SYSTEM_PROMPT = """\
 You are a prediction market analyst specialising in cross-market causal inference.
@@ -83,7 +83,7 @@ def rerank(
         logger.info("No candidates to rerank", extra={"focus": focus.ticker})
         return []
 
-    client = Groq()
+    client = OpenAI()
 
     # Randomise order to neutralise LLM positional bias
     shuffled = candidates.copy()
@@ -110,7 +110,7 @@ def rerank(
     )
 
     response = client.chat.completions.create(
-        model=_GROQ_MODEL,
+        model=_MODEL,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
