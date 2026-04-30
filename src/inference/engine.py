@@ -7,6 +7,7 @@ InferenceReport with mispricings and quarter-Kelly position sizes.
 """
 
 import json
+from typing import TYPE_CHECKING
 
 from openai import OpenAI
 
@@ -20,9 +21,15 @@ from src.inference.models import (
 from src.insight.models import MarketSnapshot
 from src.utils.logging import get_logger
 
+if TYPE_CHECKING:
+    from src.backtest.cache import InferenceCache
+
 logger = get_logger(__name__)
 
 _MODEL = "gpt-4o"
+
+# Bumped on prompt changes — included in cache key so old entries naturally expire.
+PROMPT_VERSION = "v1"
 
 _SYSTEM_PROMPT = """\
 You are a quantitative prediction market analyst specialising in cross-market inference.
@@ -135,14 +142,18 @@ def _compute_kelly_fraction(mispricing: Mispricing) -> float:
 def run_inference(
     snapshot: MarketSnapshot,
     context: list[ContextMarket],
+    cache: "InferenceCache | None" = None,
 ) -> InferenceReport:
     """
     Run cross-market inference against the focus snapshot and its context markets.
     Returns a fully populated InferenceReport with quarter-Kelly position sizes.
     Falls back to single-market analysis when context is empty.
-    """
-    client = OpenAI()
 
+    cache: optional InferenceCache. Live callers pass None (no caching);
+           backtest callers pass a cache for reproducibility. When the cache is
+           in use, temperature is forced to 0 and the response is cached by
+           prompt+model+temperature+PROMPT_VERSION.
+    """
     prompt = _USER_TEMPLATE.format(
         ticker=snapshot.market,
         title=snapshot.event,
@@ -155,29 +166,42 @@ def run_inference(
         context_block=_build_context_block(context),
     )
 
-    logger.info(
-        "Calling Groq inference engine",
-        extra={"market": snapshot.market, "context_markets": len(context)},
-    )
+    full_prompt_for_cache = f"SYSTEM:\n{_SYSTEM_PROMPT}\n\nUSER:\n{prompt}"
+    raw: dict | None = None
 
-    response = client.chat.completions.create(
-        model=_MODEL,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        max_tokens=4000,
-    )
+    if cache is not None:
+        cached = cache.get(full_prompt_for_cache, _MODEL, 0.0, PROMPT_VERSION)
+        if cached is not None:
+            raw = cached
+            logger.info("Inference cache hit", extra={"market": snapshot.market})
 
-    try:
-        raw = json.loads(response.choices[0].message.content)
-    except Exception as exc:
-        logger.warning(
-            "Failed to parse inference response",
-            extra={"market": snapshot.market, "error": str(exc)},
+    if raw is None:
+        client = OpenAI()
+        logger.info(
+            "Calling inference LLM",
+            extra={"market": snapshot.market, "context_markets": len(context),
+                   "cached": False, "model": _MODEL},
         )
-        raise
+        response = client.chat.completions.create(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=4000,
+            temperature=0.0 if cache is not None else 1.0,
+        )
+        try:
+            raw = json.loads(response.choices[0].message.content)
+        except Exception as exc:
+            logger.warning(
+                "Failed to parse inference response",
+                extra={"market": snapshot.market, "error": str(exc)},
+            )
+            raise
+        if cache is not None:
+            cache.put(full_prompt_for_cache, _MODEL, 0.0, PROMPT_VERSION, raw)
 
     derived_probabilities = [
         DerivedProbability(**item)

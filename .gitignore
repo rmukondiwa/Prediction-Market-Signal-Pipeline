@@ -3,3 +3,9 @@ keys/
 **/__pycache__/
 *.pyc
 .DS_Store
+.venv/
+.pytest_cache/
+data/archive/
+data/backtest_cache/
+data/calibration_map.pkl
+reports/
