@@ -107,6 +107,33 @@ def sample_context_markets(sample_catalog):
 
 
 @pytest.fixture
+def sample_catalog_for_arb():
+    """Real-shaped Ohio-style stacked thresholds with values that DO satisfy
+    monotonicity. Used to verify the scanner reports zero false positives."""
+    from src.catalog.models import CatalogMarket
+    return [
+        CatalogMarket(ticker="OH-1000000", event_ticker="OH-EVT", title="Ohio turnout",
+                      subtitle="Above 1.0M", category="Politics", status="open",
+                      yes_bid=29, yes_ask=30, implied_probability=0.295),
+        CatalogMarket(ticker="OH-1100000", event_ticker="OH-EVT", title="Ohio turnout",
+                      subtitle="Above 1.1M", category="Politics", status="open",
+                      yes_bid=14, yes_ask=15, implied_probability=0.145),
+        CatalogMarket(ticker="OH-1200000", event_ticker="OH-EVT", title="Ohio turnout",
+                      subtitle="Above 1.2M", category="Politics", status="open",
+                      yes_bid=4, yes_ask=5, implied_probability=0.045),
+        CatalogMarket(ticker="OH-700000", event_ticker="OH-EVT", title="Ohio turnout",
+                      subtitle="Above 700k", category="Politics", status="open",
+                      yes_bid=75, yes_ask=78, implied_probability=0.765),
+        CatalogMarket(ticker="OH-800000", event_ticker="OH-EVT", title="Ohio turnout",
+                      subtitle="Above 800k", category="Politics", status="open",
+                      yes_bid=58, yes_ask=59, implied_probability=0.585),
+        CatalogMarket(ticker="OH-900000", event_ticker="OH-EVT", title="Ohio turnout",
+                      subtitle="Above 900k", category="Politics", status="open",
+                      yes_bid=42, yes_ask=46, implied_probability=0.44),
+    ]
+
+
+@pytest.fixture
 def sample_inference_report(sample_market_snapshot, sample_context_markets):
     from src.inference.models import (
         DerivedProbability,
