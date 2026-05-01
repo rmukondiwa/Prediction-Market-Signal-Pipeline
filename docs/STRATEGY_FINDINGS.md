@@ -311,6 +311,80 @@ logs/
   paper_decay.jsonl            # live forward-test event stream
 ```
 
+## ⚠️ Post-audit correction (added end-of-session)
+
+The mid-session live forward-test totals I was reporting in chat were
+**inflated by ~64%** due to a position-accounting issue I didn't catch
+in real time. Real numbers from auditing the full event log:
+
+| | Reported in-session | Actual (audited) |
+|---|---|---|
+| Win rate | 17/17 = 100% | **16/17 = 94%** |
+| Net P&L (75 min) | +$71.47 | **+$25.80** |
+| Phantom gains | — | **+$45.67** |
+
+### Two real bugs surfaced by the audit
+
+**Bug A — `src/portfolio/state.py` `_handle_opposite_side_fill`**
+When a fill on the opposite side fully closes an existing position AND has
+leftover contracts beyond what was needed to close, those leftover contracts
+are silently dropped instead of opening a new position on the opposite side.
+
+Confirmed instance: DOGE 06:15 Fill 4 (NO 100 contracts to close 42 YES
+contracts) — 58 contracts vanished. The user paid for the order in
+implied terms but no position was created.
+
+```
+# State.py current:
+remaining = pos.contracts - closing   # = 42 - 100 = -58 (negative!)
+if remaining <= 0:
+    await self.backend.hdel(self._k("positions"), fill.ticker)  # closes position
+    # BUG: doesn't open a new opposite-side position with abs(remaining) contracts
+```
+
+**Bug B — `scripts/paper_trade_decay.py` session reporting**
+The settlement events I was summing for in-chat session totals don't
+include realized P&L from intermediate opposite-side closures. State.py
+correctly tracks `realized_pnl` running total, but the log only emits
+realized P&L through the `settled` event (which only fires when Kalshi
+finalizes a market — not when an opposite-side fill closes part of a
+position mid-window).
+
+Net effect: every market that had a self-hedge closure looked like a pure
+"final settlement" win in chat, even if the closure was a meaningful loss.
+
+### Root cause of the hallucination
+
+I trusted my own running summary across notification messages instead of
+auditing source data. **"100% win rate" should have been the immediate
+red flag** — the empirical bias yields 93-98% win rates, not 100%.
+Confirmation bias on every winning notification, and I didn't check until
+explicitly asked.
+
+## Tomorrow's priority work
+
+Order of attack when we resume:
+
+1. **Fix Bug A** (state.py): when opposite-side fill closes position with
+   leftover, open new position on the opposite side with `abs(remaining)`
+   contracts at the fill price. Add a unit test for this case.
+2. **Fix Bug B** (paper_trade_decay.py): add `realized_pnl` to every
+   `tick_summary` event from `state.get_realized_pnl()`. Source of truth
+   for session P&L is the running realized_pnl, not summed settlement events.
+3. **Build `scripts/audit_paper_session.py`** as the canonical post-session
+   audit tool. Re-runs the per-market PnL replay we did manually today.
+   Should be run before reporting any session results.
+4. **Add red-flag detection**: anytime win rate >= 99% over n>=20 trades,
+   the audit script should flag "suspicious — manual review required".
+5. **Per-market exposure cap aggregated across trail_up steps**
+   (the high-priority fix from the weakness inventory — got bumped today by
+   the audit work).
+6. **Correlated-cluster cap** (treat all crypto cryptos as one risk bucket).
+7. **Daily loss kill switch** in the trader.
+
+Plus the strategic bigger items from the weakness inventory (CalibratedLLM
+training, Coinbase/Binance ML model, etc.) once the immediate hardening is done.
+
 ## Honest performance picture
 
 After all the audits, fixes, and tuning:
