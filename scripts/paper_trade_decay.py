@@ -206,10 +206,18 @@ class DecayPaperTrader:
         return True
 
     async def tick(self) -> dict:
-        """One scan: trail_up entry on YES (each yes threshold) and NO (each no threshold)."""
+        """One scan: trail_up entry on YES (each yes threshold) and NO (each no threshold).
+
+        BUG FIX: previously we'd enter NO on a market we already had YES on (and
+        vice versa) when implied whipsawed. That hedges against ourselves and
+        guarantees a loss. Now we check existing positions per market and skip
+        opposite-side entries entirely. The original side keeps trailing as
+        more thresholds clear; the opposite side is gated by lock-out."""
         open_markets = await fetch_open_markets(self.session, self.targets)
         now = dt.datetime.now(dt.timezone.utc)
         cash = await self.state.get_cash()
+        # Snapshot positions once per tick (avoids hammering Redis)
+        existing_positions = {p.ticker: p.side for p in await self.state.list_positions()}
 
         decisions = 0
         fills = 0
@@ -229,30 +237,41 @@ class DecayPaperTrader:
             mid = (bid + ask) / 2
 
             hit = self.hit_thresholds.setdefault(ticker, {"yes": set(), "no": set()})
+            existing_side = existing_positions.get(ticker)  # None | "yes" | "no"
 
-            # YES side: trail_up
-            for thr in self.yes_thresholds:
-                if thr in hit["yes"]: continue
-                if mid >= thr:
-                    decisions += 1
-                    fill_price = min(0.99, ask + 0.005)
-                    if await self._maybe_fill(ticker, m, "yes", mid, fill_price,
-                                               ask_sz, mins_to_close, now, thr, cash):
-                        fills += 1
-                    hit["yes"].add(thr)
-            # NO side: trail_up
-            for thr in self.no_thresholds:
-                if thr in hit["no"]: continue
-                if mid <= thr:
-                    decisions += 1
-                    no_ask = 1.0 - bid
-                    fill_price = min(0.99, no_ask + 0.005)
-                    # use NO-side ask_size — approximate as bid_size
-                    no_sz = float(m.get("yes_bid_size_fp", 0) or 0)
-                    if await self._maybe_fill(ticker, m, "no", mid, fill_price,
-                                               no_sz, mins_to_close, now, thr, cash):
-                        fills += 1
-                    hit["no"].add(thr)
+            # YES side: only if we don't already have a NO position on this market
+            if existing_side != "no":
+                for thr in self.yes_thresholds:
+                    if thr in hit["yes"]: continue
+                    if mid >= thr:
+                        decisions += 1
+                        fill_price = min(0.99, ask + 0.005)
+                        if await self._maybe_fill(ticker, m, "yes", mid, fill_price,
+                                                   ask_sz, mins_to_close, now, thr, cash):
+                            fills += 1
+                        hit["yes"].add(thr)
+            else:
+                await self._emit({"event": "signal_skipped", "ticker": ticker,
+                                  "reason": "opposite_position_exists",
+                                  "side": "yes", "existing_side": "no", "mid": mid})
+
+            # NO side: only if we don't already have a YES position on this market
+            if existing_side != "yes":
+                for thr in self.no_thresholds:
+                    if thr in hit["no"]: continue
+                    if mid <= thr:
+                        decisions += 1
+                        no_ask = 1.0 - bid
+                        fill_price = min(0.99, no_ask + 0.005)
+                        no_sz = float(m.get("yes_bid_size_fp", 0) or 0)
+                        if await self._maybe_fill(ticker, m, "no", mid, fill_price,
+                                                   no_sz, mins_to_close, now, thr, cash):
+                            fills += 1
+                        hit["no"].add(thr)
+            else:
+                await self._emit({"event": "signal_skipped", "ticker": ticker,
+                                  "reason": "opposite_position_exists",
+                                  "side": "no", "existing_side": "yes", "mid": mid})
 
         return {"open_markets": len(open_markets), "decisions": decisions,
                 "fills": fills, "cash": cash}
