@@ -38,33 +38,49 @@ from statistics import mean, median, stdev
 META_PATH = Path("data/decay_universe_meta.json")
 CANDLES_PATH = Path("data/decay_candles.json")
 
-FEE_PER_CONTRACT = 0.01  # placeholder; Kalshi's fee schedule is roughly $0.01-0.02
-SLIPPAGE = 0.005          # 0.5 cent on the take side
-CONTRACTS_PER_TRADE = 100  # nominal sizing for P&L scale
+# Kalshi fee schedule (approx, retail tier as of 2025-2026):
+#   - Trade fee: round(0.07 * contracts * yes_price * (1 - yes_price)) capped per
+#     contract. Worst case ~$0.0175/contract at price 0.50; near zero at extremes.
+#   - Withdrawal: ~10% take on net profits (Series B funding round changed this;
+#     stay conservative).
+# Modelled separately below so we can sanity-check sensitivity.
+FEE_PER_CONTRACT_BASE = 0.02   # conservative average effective trade fee/ct
+SLIPPAGE = 0.005                # 0.5 cent worse than ask on the take side
+WITHDRAWAL_FEE_RATE = 0.10      # 10% on net profits at withdrawal
+MIN_CANDLE_VOLUME = 1           # skip stale-quote candles with zero volume
+CONTRACTS_PER_TRADE = 100       # nominal sizing for P&L scale
 
 
 def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def candle_mid_ask(c: dict) -> tuple[float | None, float | None]:
-    """Return (mid, ask) in dollars. None if missing."""
+def candle_quotes(c: dict) -> tuple[float | None, float | None, float]:
+    """Return (yes_bid, yes_ask, volume) in dollars/contracts. None on bad data."""
     yb = c.get("yes_bid", {})
     ya = c.get("yes_ask", {})
     bid = yb.get("close_dollars")
     ask = ya.get("close_dollars")
     if bid is None or ask is None:
-        return None, None
+        return None, None, 0.0
     try:
         bid_f = float(bid)
         ask_f = float(ask)
+        vol = float(c.get("volume_fp", 0) or 0)
     except (TypeError, ValueError):
-        return None, None
+        return None, None, 0.0
     if bid_f <= 0 and ask_f <= 0:
-        return None, None
-    if bid_f > ask_f:  # malformed entry
-        return None, None
-    return (bid_f + ask_f) / 2, ask_f
+        return None, None, vol
+    if bid_f > ask_f:
+        return None, None, vol
+    return bid_f, ask_f, vol
+
+
+def trade_fee(price: float, contracts: int) -> float:
+    """Kalshi-style per-trade fee: round(0.07 * contracts * price * (1-price)).
+    Returns total fee in dollars (not per-contract)."""
+    p = max(0.001, min(0.999, price))
+    return round(0.07 * contracts * p * (1 - p), 4)
 
 
 def simulate_one(
@@ -93,40 +109,56 @@ def simulate_one(
         if hours_to_close <= 0 or hours_to_close > max_hours:
             continue
 
-        mid, ask = candle_mid_ask(c)
-        if mid is None or ask is None:
+        bid, ask, volume = candle_quotes(c)
+        if bid is None or ask is None:
+            continue
+        # Volume gate: skip candles where nothing actually traded —
+        # quotes there are stale and our "fill at ask" assumption is fiction.
+        if volume < MIN_CANDLE_VOLUME:
             continue
 
-        # YES-side decay
+        mid = (bid + ask) / 2
+
+        # YES-side decay: enter at YES ask + slippage
         if mid >= min_implied and not seen_signal:
             fill_price = min(0.99, ask + SLIPPAGE)
             won = (settlement_value == 1.0)
             payoff = 1.0 if won else 0.0
-            pnl = (payoff - fill_price) - FEE_PER_CONTRACT
+            gross_pnl_per_ct = payoff - fill_price
+            fee = trade_fee(fill_price, CONTRACTS_PER_TRADE) / CONTRACTS_PER_TRADE
+            pnl = gross_pnl_per_ct - fee
             entries.append({
                 "ticker": meta["ticker"], "side": "yes",
                 "fill_price": fill_price, "implied_at_entry": mid,
                 "hours_to_close": hours_to_close,
                 "outcome": settlement_value,
-                "won": won, "pnl_per_contract": pnl,
+                "won": won,
+                "gross_pnl_per_contract": gross_pnl_per_ct,
+                "pnl_per_contract": pnl,
+                "fee_per_contract": fee,
                 "category": meta.get("event_ticker", "").split("-")[0],
             })
             seen_signal = True
-            break  # one entry per market
+            break
 
-        # NO-side decay (mirror)
+        # NO-side decay: buy NO. Real no_ask ≈ 1 - yes_bid (best yes-sell price).
         if no_max_implied is not None and mid <= no_max_implied and not seen_signal:
-            no_ask = 1.0 - (mid - 0.005)  # approximate no-side ask
+            no_ask = 1.0 - bid  # honest NO ask from the bid-ask relationship
             fill_price = min(0.99, no_ask + SLIPPAGE)
             won = (settlement_value == 0.0)
             payoff = 1.0 if won else 0.0
-            pnl = (payoff - fill_price) - FEE_PER_CONTRACT
+            gross_pnl_per_ct = payoff - fill_price
+            fee = trade_fee(fill_price, CONTRACTS_PER_TRADE) / CONTRACTS_PER_TRADE
+            pnl = gross_pnl_per_ct - fee
             entries.append({
                 "ticker": meta["ticker"], "side": "no",
                 "fill_price": fill_price, "implied_at_entry": mid,
                 "hours_to_close": hours_to_close,
                 "outcome": settlement_value,
-                "won": won, "pnl_per_contract": pnl,
+                "won": won,
+                "gross_pnl_per_contract": gross_pnl_per_ct,
+                "pnl_per_contract": pnl,
+                "fee_per_contract": fee,
                 "category": meta.get("event_ticker", "").split("-")[0],
             })
             seen_signal = True
@@ -188,9 +220,41 @@ def run_one_config(meta: dict, candles: dict, min_implied: float, max_hours: flo
         return {"n": 0, "min_implied": min_implied, "max_hours": max_hours}
 
     pnls = [e["pnl_per_contract"] for e in all_entries]
+    costs = [e["fill_price"] for e in all_entries]
+    # Return on capital per trade = pnl / cost (dollar in, dollar back out at settle)
+    roc = [p / c if c > 0 else 0.0 for p, c in zip(pnls, costs)]
+
     wins = sum(1 for e in all_entries if e["won"])
     mean_pnl, lo, hi = bootstrap_mean_ci(pnls)
+    mean_roc, roc_lo, roc_hi = bootstrap_mean_ci(roc)
     max_dd, sharpe = equity_curve_drawdown(pnls)
+
+    # Compound with FRACTIONAL sizing: bet a small % of bankroll per trade.
+    # Full-bankroll sizing bankrupts at the first loss (one trade resolving
+    # against a 0.85 bet wipes 85% of capital). Kelly for 97% win-rate /
+    # 12% payoff is roughly 2-3%; we use 2% as the test sizing.
+    SIZING_FRACTION = 0.02
+    eq = 1.0
+    for r in roc:
+        eq *= (1 + SIZING_FRACTION * r)
+    fractional_compound_return = eq - 1
+
+    # Total $ P&L net of withdrawal fee on net profits
+    gross_total_pnl = sum(pnls) * CONTRACTS_PER_TRADE
+    net_total_pnl = gross_total_pnl * (1 - WITHDRAWAL_FEE_RATE) if gross_total_pnl > 0 else gross_total_pnl
+    total_capital = sum(costs) * CONTRACTS_PER_TRADE
+    portfolio_roc = (net_total_pnl / total_capital) if total_capital > 0 else 0.0
+
+    # Estimate max concurrent positions (capital lock-up estimate)
+    # Sort entries by entry timestamp, count overlap with hours_to_close as
+    # the holding period.
+    entries_sorted = sorted(all_entries, key=lambda e: e.get("hours_to_close", 0), reverse=True)
+    # We don't have actual entry timestamps in the entry dicts; approximate
+    # by spreading uniformly over the year and counting concurrency given the
+    # avg holding period.
+    avg_hold_h = mean([e["hours_to_close"] for e in all_entries]) if all_entries else 0
+    avg_concurrent = (len(all_entries) * avg_hold_h) / (365 * 24) if all_entries else 0
+    estimated_working_capital = avg_concurrent * mean(costs) * CONTRACTS_PER_TRADE if all_entries else 0
 
     # By category breakdown
     by_cat: dict[str, list[float]] = defaultdict(list)
@@ -206,7 +270,16 @@ def run_one_config(meta: dict, candles: dict, min_implied: float, max_hours: flo
         "mean_pnl_per_contract": mean_pnl,
         "ci_low": lo, "ci_high": hi,
         "median_pnl": median(pnls),
-        "total_pnl_dollars": sum(pnls) * CONTRACTS_PER_TRADE,
+        "mean_cost_per_contract": mean(costs),
+        "mean_roc_per_trade": mean_roc,
+        "roc_ci_low": roc_lo, "roc_ci_high": roc_hi,
+        "fractional_compound_return": fractional_compound_return,  # 2% sizing
+        "portfolio_roc_net": portfolio_roc,  # net of withdrawal fee
+        "gross_total_pnl_dollars": gross_total_pnl,
+        "net_total_pnl_dollars": net_total_pnl,
+        "total_capital_deployed": total_capital,
+        "avg_concurrent_positions": avg_concurrent,
+        "estimated_working_capital": estimated_working_capital,
         "max_drawdown_dollars": max_dd,
         "sharpe": sharpe,
         "by_category": {cat: {"n": len(v), "win_rate": sum(1 for x in v if x>0)/len(v),
@@ -265,21 +338,51 @@ def main() -> None:
         print(f"\n  Report: {args.output}")
         return
 
-    print("=== Parameter sweep ===")
-    print(f"{'min_imp':>8}  {'max_h':>6}  {'n':>4}  {'wins':>4}  {'win%':>6}  "
-          f"{'mean_pnl':>9}  {'sharpe':>7}  {'max_dd$':>8}")
-    print("  " + "-" * 76)
+    print("=== Parameter sweep (sound execution: ask+slip+Kalshi fees+10% withdrawal+volume gate) ===")
+    print(f"{'min_imp':>8} {'max_h':>5} {'n':>4} {'win%':>5} "
+          f"{'pnl/ct':>8} {'roc/tr':>7} {'compd2%':>8} {'sharpe':>6} "
+          f"{'net_pnl':>8} {'work_cap':>9} {'max_dd':>7}")
+    print("  " + "-" * 95)
     sweep_results = []
-    for thr in [0.85, 0.90, 0.93, 0.95, 0.97]:
+    for thr in [0.65, 0.70, 0.75, 0.80, 0.85, 0.88, 0.90, 0.93, 0.95, 0.97]:
         for hrs in [12, 24, 48, 72, 168]:
             r = run_one_config(meta, candles, thr, float(hrs), args.include_no_side)
             sweep_results.append({k: v for k, v in r.items() if k != "entries"})
             if r["n"] == 0:
-                print(f"  {thr:>6.2f}  {hrs:>6.0f}  {0:>4}  {0:>4}  {'-':>6}  {'-':>9}  {'-':>7}  {'-':>8}")
+                print(f"  {thr:>6.2f} {hrs:>5.0f} {0:>4} {'-':>5} "
+                      f"{'-':>8} {'-':>7} {'-':>9} {'-':>6} "
+                      f"{'-':>8} {'-':>9} {'-':>7}")
             else:
-                print(f"  {thr:>6.2f}  {hrs:>6.0f}  {r['n']:>4}  {r['wins']:>4}  "
-                      f"{r['win_rate']*100:>5.1f}%  {r['mean_pnl_per_contract']:>+9.4f}  "
-                      f"{r['sharpe']:>+7.2f}  {r['max_drawdown_dollars']:>8.2f}")
+                print(f"  {thr:>6.2f} {hrs:>5.0f} {r['n']:>4} "
+                      f"{r['win_rate']*100:>4.1f}% "
+                      f"{r['mean_pnl_per_contract']:>+8.4f} "
+                      f"{r['mean_roc_per_trade']*100:>+6.2f}% "
+                      f"{r['fractional_compound_return']*100:>+7.2f}% "
+                      f"{r['sharpe']:>+6.2f} "
+                      f"${r['net_total_pnl_dollars']:>+7.1f} "
+                      f"${r['estimated_working_capital']:>8.0f} "
+                      f"${r['max_drawdown_dollars']:>6.0f}")
+
+    valid = [r for r in sweep_results if r.get("n", 0) >= 30 and r.get("net_total_pnl_dollars", 0) > 0]
+    if valid:
+        print("\n  Top 5 by SHARPE (n>=30, positive net P&L):")
+        for r in sorted(valid, key=lambda x: -x["sharpe"])[:5]:
+            print(f"    min_imp={r['min_implied']:.2f}  max_h={r['max_hours']:.0f}h  "
+                  f"sharpe={r['sharpe']:+.2f}  net_pnl=${r['net_total_pnl_dollars']:+.1f}  "
+                  f"work_cap=${r['estimated_working_capital']:.0f}  "
+                  f"compd2%={r['fractional_compound_return']*100:+.2f}%")
+        print("\n  Top 5 by ABSOLUTE NET $ P&L (Kalshi fees + 10% withdrawal):")
+        for r in sorted(valid, key=lambda x: -x["net_total_pnl_dollars"])[:5]:
+            print(f"    min_imp={r['min_implied']:.2f}  max_h={r['max_hours']:.0f}h  "
+                  f"net_pnl=${r['net_total_pnl_dollars']:+.1f}  sharpe={r['sharpe']:+.2f}  "
+                  f"work_cap=${r['estimated_working_capital']:.0f}  "
+                  f"return_on_work_cap={r['net_total_pnl_dollars']/max(r['estimated_working_capital'],1)*100:.0f}%")
+        print("\n  Top 5 by RETURN ON WORKING CAPITAL (annual, conservative):")
+        for r in sorted(valid, key=lambda x: -(x["net_total_pnl_dollars"]/max(x["estimated_working_capital"],1)))[:5]:
+            roc = r["net_total_pnl_dollars"] / max(r["estimated_working_capital"], 1) * 100
+            print(f"    min_imp={r['min_implied']:.2f}  max_h={r['max_hours']:.0f}h  "
+                  f"return_on_work_cap={roc:.0f}%  sharpe={r['sharpe']:+.2f}  "
+                  f"net_pnl=${r['net_total_pnl_dollars']:+.1f}  work_cap=${r['estimated_working_capital']:.0f}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({"sweep": sweep_results,
