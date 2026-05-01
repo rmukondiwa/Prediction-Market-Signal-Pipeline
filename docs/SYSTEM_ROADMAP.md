@@ -15,28 +15,35 @@ But: **the LLM is reliable as a retrieval and structuring layer, not as a probab
 
 The trading signal is a `CalibratedEdge` from a signal model, not an `Edge` from the LLM directly.
 
-## Current state — honest assessment
+## Current state — UPDATED after Phase 5 build
 
-What Raphael shipped through Phase 4 is a **signal generation pipeline**, not a trading system. Roughly 30% of the full stack. There is currently no order placement, no portfolio state, no risk management, no backtest, no paper trading, no live monitoring loop, no settlement tracking, no P&L attribution. The `InferenceReport.suggested_edges[]` is research output — actionable in spirit but not in code.
+What started as a 30%-complete pipeline has been built out. **All five
+infrastructure stages of Phase 5 are implemented** (storage, backtest, signals,
+portfolio/risk, paper execution). Live forward-test running on the public
+Kalshi API as of 2026-05-01.
 
-This document maps the full stack and sequences what's left.
+For the actual results — which strategies worked, what the backtest numbers
+say, what failed and why, the live paper-trader status — see the companion
+[STRATEGY_FINDINGS.md](STRATEGY_FINDINGS.md).
+
+This document remains the architectural overview.
 
 ## Layered architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ Layer 9: Operations         scheduler · monitoring · alerts      │  TODO
+│ Layer 9: Operations         scheduler · monitoring · alerts      │  PARTIAL
 ├──────────────────────────────────────────────────────────────────┤
-│ Layer 8: Execution          trading client · paper · live        │  TODO
+│ Layer 8: Execution          trading client · paper · live        │  PAPER ✓ / LIVE TODO
 ├──────────────────────────────────────────────────────────────────┤
-│ Layer 7: Portfolio & Risk   state · risk gates · sizing          │  TODO
+│ Layer 7: Portfolio & Risk   state · risk gates · sizing          │  DONE (Phase 5)
 ├──────────────────────────────────────────────────────────────────┤
-│ Layer 6: Validation         backtest framework · cache · metrics │  TODO
+│ Layer 6: Validation         backtest framework · cache · metrics │  DONE (Phase 5)
 ├──────────────────────────────────────────────────────────────────┤
-│ Layer 5: Signal models      consistency · calibration · base     │  TODO
-│                             rate · coherence regression          │
+│ Layer 5: Signal models      consistency · calibration · base     │  DONE — settlement_decay
+│                             rate · coherence regression           │  in production paper trade
 ├──────────────────────────────────────────────────────────────────┤
-│ Layer 4: Historical Archive snapshotter · catalog · resolutions  │  TODO
+│ Layer 4: Historical Archive snapshotter · catalog · resolutions  │  DONE (Phase 5)
 ├──────────────────────────────────────────────────────────────────┤
 │ Layer 3: Cross-market LLM   catalog · embed · retrieve · infer   │  DONE (Phase 4)
 ├──────────────────────────────────────────────────────────────────┤
@@ -44,6 +51,9 @@ This document maps the full stack and sequences what's left.
 ├──────────────────────────────────────────────────────────────────┤
 │ Layer 1: Ingestion          WS · parser · normalizer · Redis     │  DONE (Phase 1)
 └──────────────────────────────────────────────────────────────────┘
+
+Forward paper-trade running with strategy `settlement_decay_trail_up`.
+First 3 settlements: 3/3 wins. See STRATEGY_FINDINGS.md for full numbers.
 ```
 
 ### Layer 1 — Ingestion (DONE)
