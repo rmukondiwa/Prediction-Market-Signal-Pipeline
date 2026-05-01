@@ -73,7 +73,7 @@ async def fetch_open_markets(session: aiohttp.ClientSession,
             for m in e.get("markets", []) or []:
                 if m.get("status") in {"open", "active"}:
                     out.append(m)
-            # Some responses don't embed; fetch the full event
+            # /events list doesn't include markets — fetch each event's detail
             if not e.get("markets"):
                 ev_ticker = e.get("event_ticker", "")
                 if not ev_ticker:
@@ -84,6 +84,13 @@ async def fetch_open_markets(session: aiohttp.ClientSession,
                         if r2.status >= 400:
                             continue
                         ed = await r2.json()
+                    # Markets live at the TOP LEVEL of the response, not nested
+                    # under "event" — this took a debug session to figure out
+                    for m in ed.get("markets", []) or []:
+                        if m.get("status") in {"open", "active"}:
+                            out.append(m)
+                    # Belt-and-braces: also check the embedded version in case
+                    # the API ever changes
                     for m in ed.get("event", {}).get("markets", []) or []:
                         if m.get("status") in {"open", "active"}:
                             out.append(m)
