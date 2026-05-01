@@ -130,19 +130,22 @@ def compute_size(bankroll: float, max_fraction: float,
 class DecayPaperTrader:
     def __init__(self, target_series: set[str], state: PortfolioState,
                  client: KalshiTradingClientStub,
-                 min_implied: float, max_minutes: float,
-                 max_fraction: float, log_path: Path,
-                 starting_bankroll: float):
+                 yes_thresholds: list[float], no_thresholds: list[float],
+                 max_minutes: float, max_fraction: float,
+                 log_path: Path, starting_bankroll: float):
         self.targets = target_series
         self.state = state
         self.client = client
-        self.min_implied = min_implied
+        # trail_up: enter at each threshold step, once per side per market
+        self.yes_thresholds = sorted(yes_thresholds)
+        self.no_thresholds = sorted(no_thresholds)
         self.max_minutes = max_minutes
         self.max_fraction = max_fraction
         self.log = log_path
         self.starting_bankroll = starting_bankroll
         self.session = None
-        self.last_seen_signals: dict[str, dt.datetime] = {}
+        # per-market threshold-hit state: {ticker: {"yes": set, "no": set}}
+        self.hit_thresholds: dict[str, dict[str, set]] = {}
         self._log_lock = asyncio.Lock()
 
     async def __aenter__(self):
@@ -159,8 +162,51 @@ class DecayPaperTrader:
             with self.log.open("a") as f:
                 f.write(json.dumps(event, default=str) + "\n")
 
+    async def _maybe_fill(self, ticker: str, m: dict, side: str, mid: float,
+                          fill_price: float, ask_sz: float, mins_to_close: float,
+                          now: dt.datetime, threshold: float, cash: float) -> bool:
+        """Place a paper order if depth-aware sizing is positive. Returns True
+        on a successful fill."""
+        contracts = compute_size(
+            bankroll=cash, max_fraction=self.max_fraction,
+            ask_price=fill_price, ask_size=ask_sz,
+        )
+        if contracts <= 0:
+            await self._emit({"event": "signal_skipped", "ticker": ticker,
+                              "reason": "zero_size", "side": side,
+                              "fill_price": fill_price, "ask_size": ask_sz,
+                              "threshold": threshold})
+            return False
+
+        req = OrderRequest(
+            ticker=ticker, side=side, contracts=contracts,
+            order_type="limit", limit_price=fill_price,
+            time_in_force="ioc",
+            client_order_id=f"decay-{uuid.uuid4().hex[:10]}",
+            placed_at=now,
+        )
+        result = await self.client.place_order(req)
+        if not result.accepted:
+            return False
+        fill = Fill(
+            fill_id=f"paper-{uuid.uuid4().hex[:10]}",
+            order_id=result.order_id,
+            ticker=ticker, side=side,
+            contracts=contracts, price=fill_price,
+            fee=round(0.07 * contracts * fill_price * (1 - fill_price), 4),
+            timestamp=now, signal_model=f"settlement_decay_trail_{side}@{threshold:.2f}",
+        )
+        await self.state.apply_fill(fill)
+        await self._emit({"event": "fill", "ticker": ticker, "side": side,
+                          "contracts": contracts, "price": fill_price,
+                          "implied_at_entry": mid, "threshold": threshold,
+                          "minutes_to_close": mins_to_close,
+                          "ask_size": ask_sz, "fee": fill.fee,
+                          "title": m.get("title", "")[:60]})
+        return True
+
     async def tick(self) -> dict:
-        """One scan of all open markets in target series."""
+        """One scan: trail_up entry on YES (each yes threshold) and NO (each no threshold)."""
         open_markets = await fetch_open_markets(self.session, self.targets)
         now = dt.datetime.now(dt.timezone.utc)
         cash = await self.state.get_cash()
@@ -181,54 +227,32 @@ class DecayPaperTrader:
                 continue
             bid, ask, ask_sz = quote
             mid = (bid + ask) / 2
-            if mid < self.min_implied:
-                continue
-            # Don't double-fill the same market within the same window
-            last = self.last_seen_signals.get(ticker)
-            if last and (now - last).total_seconds() < 60:
-                continue
 
-            decisions += 1
-            contracts = compute_size(
-                bankroll=cash, max_fraction=self.max_fraction,
-                ask_price=ask, ask_size=ask_sz,
-            )
-            if contracts <= 0:
-                await self._emit({"event": "signal_skipped", "ticker": ticker,
-                                  "reason": "zero_size", "ask": ask, "ask_size": ask_sz})
-                self.last_seen_signals[ticker] = now
-                continue
+            hit = self.hit_thresholds.setdefault(ticker, {"yes": set(), "no": set()})
 
-            # Place a paper order via the stub (records intent)
-            req = OrderRequest(
-                ticker=ticker, side="yes", contracts=contracts,
-                order_type="limit", limit_price=ask,
-                time_in_force="ioc",
-                client_order_id=f"decay-{uuid.uuid4().hex[:10]}",
-                placed_at=now,
-            )
-            result = await self.client.place_order(req)
-            if not result.accepted:
-                continue
-
-            # Synthetic fill at the ask
-            fill = Fill(
-                fill_id=f"paper-{uuid.uuid4().hex[:10]}",
-                order_id=result.order_id,
-                ticker=ticker, side="yes",
-                contracts=contracts, price=ask,
-                fee=round(0.07 * contracts * ask * (1 - ask), 4),
-                timestamp=now, signal_model="settlement_decay",
-            )
-            await self.state.apply_fill(fill)
-            fills += 1
-            self.last_seen_signals[ticker] = now
-            await self._emit({"event": "fill", "ticker": ticker,
-                              "contracts": contracts, "price": ask,
-                              "implied_at_entry": mid,
-                              "minutes_to_close": mins_to_close,
-                              "ask_size": ask_sz, "fee": fill.fee,
-                              "title": m.get("title", "")[:60]})
+            # YES side: trail_up
+            for thr in self.yes_thresholds:
+                if thr in hit["yes"]: continue
+                if mid >= thr:
+                    decisions += 1
+                    fill_price = min(0.99, ask + 0.005)
+                    if await self._maybe_fill(ticker, m, "yes", mid, fill_price,
+                                               ask_sz, mins_to_close, now, thr, cash):
+                        fills += 1
+                    hit["yes"].add(thr)
+            # NO side: trail_up
+            for thr in self.no_thresholds:
+                if thr in hit["no"]: continue
+                if mid <= thr:
+                    decisions += 1
+                    no_ask = 1.0 - bid
+                    fill_price = min(0.99, no_ask + 0.005)
+                    # use NO-side ask_size — approximate as bid_size
+                    no_sz = float(m.get("yes_bid_size_fp", 0) or 0)
+                    if await self._maybe_fill(ticker, m, "no", mid, fill_price,
+                                               no_sz, mins_to_close, now, thr, cash):
+                        fills += 1
+                    hit["no"].add(thr)
 
         return {"open_markets": len(open_markets), "decisions": decisions,
                 "fills": fills, "cash": cash}
@@ -271,7 +295,8 @@ class DecayPaperTrader:
         await self._emit({"event": "start",
                           "starting_bankroll": self.starting_bankroll,
                           "targets": sorted(self.targets),
-                          "min_implied": self.min_implied,
+                          "yes_thresholds": self.yes_thresholds,
+                          "no_thresholds": self.no_thresholds,
                           "max_minutes": self.max_minutes,
                           "max_fraction": self.max_fraction,
                           "tick_seconds": tick_seconds})
@@ -296,13 +321,15 @@ class DecayPaperTrader:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--series", type=str, default=",".join(DEFAULT_SERIES),
-                   help="Comma-separated event series prefixes")
+    p.add_argument("--series", type=str, default=",".join(DEFAULT_SERIES))
     p.add_argument("--bankroll", type=float, default=5_000.0)
-    p.add_argument("--min-implied", type=float, default=0.80)
+    p.add_argument("--yes-thresholds", type=str, default="0.75,0.85,0.95",
+                   help="Trail-up YES entry thresholds (comma-separated)")
+    p.add_argument("--no-thresholds", type=str, default="0.25,0.15,0.05",
+                   help="Trail-up NO entry thresholds (comma-separated)")
     p.add_argument("--max-minutes", type=float, default=15.0)
-    p.add_argument("--max-fraction", type=float, default=0.10,
-                   help="Max bankroll fraction per trade")
+    p.add_argument("--max-fraction", type=float, default=0.05,
+                   help="Max bankroll fraction per single fill (smaller because trail_up multiplies entries per market)")
     p.add_argument("--tick-seconds", type=int, default=30)
     p.add_argument("--log", type=Path, default=Path("logs/paper_decay.jsonl"))
     return p.parse_args()
@@ -312,6 +339,8 @@ async def main() -> None:
     args = parse_args()
     args.log.parent.mkdir(parents=True, exist_ok=True)
     target_series = set(s.strip() for s in args.series.split(",") if s.strip())
+    yes_thr = sorted(float(x) for x in args.yes_thresholds.split(",") if x.strip())
+    no_thr = sorted((float(x) for x in args.no_thresholds.split(",") if x.strip()), reverse=True)
 
     backend = InMemoryBackend()
     state = PortfolioState(backend, env=f"paper_decay")
@@ -320,9 +349,9 @@ async def main() -> None:
 
     async with DecayPaperTrader(
         target_series=target_series, state=state, client=client,
-        min_implied=args.min_implied, max_minutes=args.max_minutes,
-        max_fraction=args.max_fraction, log_path=args.log,
-        starting_bankroll=args.bankroll,
+        yes_thresholds=yes_thr, no_thresholds=no_thr,
+        max_minutes=args.max_minutes, max_fraction=args.max_fraction,
+        log_path=args.log, starting_bankroll=args.bankroll,
     ) as trader:
         await trader.run(tick_seconds=args.tick_seconds)
 
