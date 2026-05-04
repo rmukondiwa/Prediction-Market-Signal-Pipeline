@@ -116,14 +116,25 @@ def compute_size(bankroll: float, max_fraction: float,
                  ask_price: float, ask_size: float,
                  depth_take_fraction: float = 0.25,
                  max_contracts_per_order: int = 5_000,
-                 max_per_market_usd: float = 500.0) -> int:
-    """Depth-aware sizing: smaller of (bankroll fraction, depth cap, hard cap)."""
+                 max_per_market_usd: float = 500.0,
+                 existing_market_notional: float = 0.0) -> int:
+    """Depth-aware sizing: smallest of (bankroll fraction, depth cap, hard cap,
+    remaining per-market headroom).
+
+    `existing_market_notional` is the dollar value of all open fills on this
+    ticker (sum of contracts × avg_cost). The per-market cap subtracts this
+    so trail_up across multiple thresholds can't aggregate past the cap.
+    Yesterday's HYPE 117ct fill was caused by this missing aggregation —
+    each individual fill respected the 5% cap but they all hit on the same
+    market in one tick.
+    """
     if ask_price <= 0:
         return 0
     by_bankroll = (bankroll * max_fraction) / ask_price
     by_depth = ask_size * depth_take_fraction
-    by_hard = max_per_market_usd / ask_price
-    contracts = int(min(by_bankroll, by_depth, by_hard, max_contracts_per_order))
+    remaining_market_usd = max(0.0, max_per_market_usd - existing_market_notional)
+    by_market = remaining_market_usd / ask_price
+    contracts = int(min(by_bankroll, by_depth, by_market, max_contracts_per_order))
     return max(0, contracts)
 
 
@@ -132,7 +143,8 @@ class DecayPaperTrader:
                  client: KalshiTradingClientStub,
                  yes_thresholds: list[float], no_thresholds: list[float],
                  max_minutes: float, max_fraction: float,
-                 log_path: Path, starting_bankroll: float):
+                 log_path: Path, starting_bankroll: float,
+                 daily_loss_limit_usd: float | None = None):
         self.targets = target_series
         self.state = state
         self.client = client
@@ -141,6 +153,8 @@ class DecayPaperTrader:
         self.no_thresholds = sorted(no_thresholds)
         self.max_minutes = max_minutes
         self.max_fraction = max_fraction
+        self.daily_loss_limit_usd = daily_loss_limit_usd
+        self.kill_switch_tripped = False
         self.log = log_path
         self.starting_bankroll = starting_bankroll
         self.session = None
@@ -164,17 +178,20 @@ class DecayPaperTrader:
 
     async def _maybe_fill(self, ticker: str, m: dict, side: str, mid: float,
                           fill_price: float, ask_sz: float, mins_to_close: float,
-                          now: dt.datetime, threshold: float, cash: float) -> bool:
+                          now: dt.datetime, threshold: float, cash: float,
+                          existing_market_notional: float = 0.0) -> bool:
         """Place a paper order if depth-aware sizing is positive. Returns True
         on a successful fill."""
         contracts = compute_size(
             bankroll=cash, max_fraction=self.max_fraction,
             ask_price=fill_price, ask_size=ask_sz,
+            existing_market_notional=existing_market_notional,
         )
         if contracts <= 0:
             await self._emit({"event": "signal_skipped", "ticker": ticker,
                               "reason": "zero_size", "side": side,
                               "fill_price": fill_price, "ask_size": ask_sz,
+                              "existing_notional": round(existing_market_notional, 2),
                               "threshold": threshold})
             return False
 
@@ -215,9 +232,29 @@ class DecayPaperTrader:
         more thresholds clear; the opposite side is gated by lock-out."""
         open_markets = await fetch_open_markets(self.session, self.targets)
         now = dt.datetime.now(dt.timezone.utc)
+
+        # Daily loss kill switch — check BEFORE doing anything else
+        realized_pnl = await self.state.get_realized_pnl()
+        if self.daily_loss_limit_usd is not None and realized_pnl <= -abs(self.daily_loss_limit_usd):
+            if not self.kill_switch_tripped:
+                await self._emit({
+                    "event": "kill_switch_tripped",
+                    "reason": "daily_loss_limit_exceeded",
+                    "realized_pnl": round(realized_pnl, 4),
+                    "limit": self.daily_loss_limit_usd,
+                })
+                self.kill_switch_tripped = True
+            return {"open_markets": len(open_markets), "decisions": 0,
+                    "fills": 0, "cash": await self.state.get_cash(),
+                    "realized_pnl": round(realized_pnl, 4),
+                    "kill_switch": "tripped"}
+
         cash = await self.state.get_cash()
         # Snapshot positions once per tick (avoids hammering Redis)
-        existing_positions = {p.ticker: p.side for p in await self.state.list_positions()}
+        positions = await self.state.list_positions()
+        existing_positions = {p.ticker: p.side for p in positions}
+        # Per-market notional for exposure-cap aggregation across trail_up steps
+        market_notional = {p.ticker: p.contracts * p.avg_cost for p in positions}
 
         decisions = 0
         fills = 0
@@ -238,6 +275,7 @@ class DecayPaperTrader:
 
             hit = self.hit_thresholds.setdefault(ticker, {"yes": set(), "no": set()})
             existing_side = existing_positions.get(ticker)  # None | "yes" | "no"
+            current_notional = market_notional.get(ticker, 0.0)
 
             # YES side: only if we don't already have a NO position on this market
             if existing_side != "no":
@@ -247,8 +285,16 @@ class DecayPaperTrader:
                         decisions += 1
                         fill_price = min(0.99, ask + 0.005)
                         if await self._maybe_fill(ticker, m, "yes", mid, fill_price,
-                                                   ask_sz, mins_to_close, now, thr, cash):
+                                                   ask_sz, mins_to_close, now, thr, cash,
+                                                   existing_market_notional=current_notional):
                             fills += 1
+                            # Tick-local accumulator so subsequent threshold steps
+                            # this same tick see updated per-market notional
+                            current_notional += compute_size(
+                                bankroll=cash, max_fraction=self.max_fraction,
+                                ask_price=fill_price, ask_size=ask_sz,
+                                existing_market_notional=current_notional - 0.001,
+                            ) * fill_price
                         hit["yes"].add(thr)
             else:
                 await self._emit({"event": "signal_skipped", "ticker": ticker,
@@ -265,16 +311,27 @@ class DecayPaperTrader:
                         fill_price = min(0.99, no_ask + 0.005)
                         no_sz = float(m.get("yes_bid_size_fp", 0) or 0)
                         if await self._maybe_fill(ticker, m, "no", mid, fill_price,
-                                                   no_sz, mins_to_close, now, thr, cash):
+                                                   no_sz, mins_to_close, now, thr, cash,
+                                                   existing_market_notional=current_notional):
                             fills += 1
+                            current_notional += compute_size(
+                                bankroll=cash, max_fraction=self.max_fraction,
+                                ask_price=fill_price, ask_size=no_sz,
+                                existing_market_notional=current_notional - 0.001,
+                            ) * fill_price
                         hit["no"].add(thr)
             else:
                 await self._emit({"event": "signal_skipped", "ticker": ticker,
                                   "reason": "opposite_position_exists",
                                   "side": "no", "existing_side": "yes", "mid": mid})
 
+        # Pull realized PnL from state — the SOURCE OF TRUTH for session P&L,
+        # including any intermediate opposite-side closures that don't show up
+        # as `settled` events. Yesterday's audit hallucination was caused by
+        # summing settled events instead of reading this back.
+        realized_pnl = await self.state.get_realized_pnl()
         return {"open_markets": len(open_markets), "decisions": decisions,
-                "fills": fills, "cash": cash}
+                "fills": fills, "cash": cash, "realized_pnl": round(realized_pnl, 4)}
 
     async def settle_finished(self) -> int:
         """Check positions whose markets have closed; settle them."""
@@ -349,6 +406,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-minutes", type=float, default=15.0)
     p.add_argument("--max-fraction", type=float, default=0.05,
                    help="Max bankroll fraction per single fill (smaller because trail_up multiplies entries per market)")
+    p.add_argument("--daily-loss-limit", type=float, default=300.0,
+                   help="Halt new orders if realized PnL drops below -this (USD)")
     p.add_argument("--tick-seconds", type=int, default=30)
     p.add_argument("--log", type=Path, default=Path("logs/paper_decay.jsonl"))
     return p.parse_args()
@@ -371,6 +430,7 @@ async def main() -> None:
         yes_thresholds=yes_thr, no_thresholds=no_thr,
         max_minutes=args.max_minutes, max_fraction=args.max_fraction,
         log_path=args.log, starting_bankroll=args.bankroll,
+        daily_loss_limit_usd=args.daily_loss_limit,
     ) as trader:
         await trader.run(tick_seconds=args.tick_seconds)
 

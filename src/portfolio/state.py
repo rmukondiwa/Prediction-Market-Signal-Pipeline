@@ -216,22 +216,56 @@ class PortfolioState:
             await self.backend.hset(self._k("positions"), fill.ticker, updated.model_dump_json())
 
     async def _handle_opposite_side_fill(self, pos: Position, fill: Fill) -> None:
-        """Fill on the opposite side closes contracts at fill.price."""
+        """Fill on the opposite side closes contracts at fill.price.
+
+        Three sub-cases:
+          1. fill.contracts < pos.contracts → partially close, position keeps remainder
+          2. fill.contracts == pos.contracts → fully close, position deleted
+          3. fill.contracts > pos.contracts → fully close existing side AND open
+             a new position on the opposite side with the leftover contracts.
+             (Without this branch, leftover contracts would be silently dropped
+             — a real bug surfaced in 2026-05-01 forward test.)
+
+        Fee is charged once on the entire fill, not per contract.
+        """
         closing = min(pos.contracts, fill.contracts)
-        # Realized P&L: (sale_price - avg_cost) * closing for closing the existing side
-        # But here "fill" is buying the OPPOSITE side, which is equivalent to selling
-        # original side at (1 - fill.price).
+        # Realized P&L: closing the existing side at the implied "sell" price.
+        # Buying NO at fill.price is mathematically the same as selling the YES
+        # side at (1 - fill.price), and vice versa.
         equivalent_sell_price = 1.0 - fill.price
         pnl = closing * (equivalent_sell_price - pos.avg_cost) - fill.fee
         await self.backend.incrbyfloat(self._k("realized_pnl"), pnl)
         await self.backend.incrbyfloat(self._daily_pnl_key(fill.timestamp), pnl)
 
-        remaining = pos.contracts - closing
-        if remaining <= 0:
-            await self.backend.hdel(self._k("positions"), fill.ticker)
+        # Cash impact for the close portion: we paid fill.price per contract
+        # closed, but we ALSO got back the equivalent_sell of the existing
+        # position. The net cash debit on the closing portion is exactly the
+        # realized PnL (already in cash via the apply_fill caller's debit).
+
+        remaining_existing = pos.contracts - closing
+        leftover_fill = fill.contracts - closing
+
+        if remaining_existing > 0:
+            # Case 1: existing side reduced, no new position
+            updated = pos.model_copy(update={
+                "contracts": remaining_existing,
+                "last_updated": fill.timestamp,
+            })
+            await self.backend.hset(self._k("positions"), fill.ticker,
+                                    updated.model_dump_json())
         else:
-            updated = pos.model_copy(update={"contracts": remaining, "last_updated": fill.timestamp})
-            await self.backend.hset(self._k("positions"), fill.ticker, updated.model_dump_json())
+            # Cases 2 + 3: existing side fully closed
+            await self.backend.hdel(self._k("positions"), fill.ticker)
+            if leftover_fill > 0:
+                # Case 3: open a new position on the OPPOSITE side with the
+                # leftover contracts at the fill price. avg_cost = fill.price.
+                new_pos = Position(
+                    ticker=fill.ticker, side=fill.side,
+                    contracts=leftover_fill, avg_cost=fill.price,
+                    opened_at=fill.timestamp, last_updated=fill.timestamp,
+                )
+                await self.backend.hset(self._k("positions"), fill.ticker,
+                                        new_pos.model_dump_json())
 
     async def settle(self, ticker: str, settlement_value: float, t: datetime) -> float:
         """Resolve a position: contracts × settlement_value goes to cash;
