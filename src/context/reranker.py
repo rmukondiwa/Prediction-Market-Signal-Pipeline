@@ -10,6 +10,7 @@ the LLM's positional bias toward items listed first.
 """
 
 import json
+import os
 import random
 
 from openai import OpenAI
@@ -20,7 +21,8 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_MODEL = "gpt-4o-mini"
+_MODEL = "gemini-2.0-flash"
+_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 _SYSTEM_PROMPT = """\
 You are a prediction market analyst specialising in cross-market causal inference.
@@ -83,7 +85,10 @@ def rerank(
         logger.info("No candidates to rerank", extra={"focus": focus.ticker})
         return []
 
-    client = OpenAI()
+    client = OpenAI(
+        api_key=os.environ["GEMINI_API_KEY"],
+        base_url=_BASE_URL,
+    )
 
     # Randomise order to neutralise LLM positional bias
     shuffled = candidates.copy()
@@ -105,7 +110,7 @@ def rerank(
     )
 
     logger.info(
-        "Calling Groq reranker",
+        "Calling Gemini reranker",
         extra={"focus": focus.ticker, "candidates": len(shuffled)},
     )
 

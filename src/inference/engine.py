@@ -7,6 +7,7 @@ InferenceReport with mispricings and quarter-Kelly position sizes.
 """
 
 import json
+import os
 
 from openai import OpenAI
 
@@ -22,7 +23,8 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_MODEL = "gpt-4o"
+_MODEL = "gemini-2.5-pro"
+_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 _SYSTEM_PROMPT = """\
 You are a quantitative prediction market analyst specialising in cross-market inference.
@@ -141,7 +143,10 @@ def run_inference(
     Returns a fully populated InferenceReport with quarter-Kelly position sizes.
     Falls back to single-market analysis when context is empty.
     """
-    client = OpenAI()
+    client = OpenAI(
+        api_key=os.environ["GEMINI_API_KEY"],
+        base_url=_BASE_URL,
+    )
 
     prompt = _USER_TEMPLATE.format(
         ticker=snapshot.market,
@@ -156,7 +161,7 @@ def run_inference(
     )
 
     logger.info(
-        "Calling Groq inference engine",
+        "Calling Gemini inference engine",
         extra={"market": snapshot.market, "context_markets": len(context)},
     )
 
