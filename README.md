@@ -49,6 +49,7 @@ python -m scripts.run_arb_live
 | **[docs/USER_MANUAL.md](docs/USER_MANUAL.md)** | **Start here.** End-to-end usage manual with diagrams, examples, troubleshooting, cost reference. |
 | [docs/OPERATOR_CHEATSHEET.md](docs/OPERATOR_CHEATSHEET.md) | One-page reference. Pin while running live. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture with diagrams, layer-by-layer component inventory. |
+| [docs/ALPHA_RESEARCH.md](docs/ALPHA_RESEARCH.md) | 10 unexplored alpha sources with concrete test instructions + a kill-fast research protocol. |
 | [docs/INFRASTRUCTURE.md](docs/INFRASTRUCTURE.md) | Existing infra reference — Kalshi WS, Redis, etc. |
 | [docs/STRATEGIES.md](docs/STRATEGIES.md) | Strategy catalog (built / researched / identified). |
 | [experiments/decay/README.md](experiments/decay/README.md) | Archived directional decay strategy work. |

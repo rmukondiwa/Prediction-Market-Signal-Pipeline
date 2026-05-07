@@ -447,14 +447,43 @@ async def main_async(args: argparse.Namespace) -> None:
             n_threshold_filtered += 1
             continue
         arb = compute_arb(c["kalshi_market"], c["poly_market"])
+        # Pull through the minimal Polymarket fields the orchestrator needs
+        # to actually trade (clobTokenIds, conditionId). The full poly_market
+        # object can be huge, so we keep just the trade-relevant subset.
+        pm_full = c.get("poly_market") or {}
+        poly_market_slim = {
+            "id": pm_full.get("id"),
+            "conditionId": pm_full.get("conditionId"),
+            "clobTokenIds": pm_full.get("clobTokenIds"),
+            "outcomes": pm_full.get("outcomes"),
+            "outcomePrices": pm_full.get("outcomePrices"),
+            "question": pm_full.get("question"),
+            "volumeNum": pm_full.get("volumeNum"),
+        }
+        # Top-of-book sizes from CLOB so the orchestrator doesn't need a
+        # second live fetch.
+        try:
+            from src.ingestion.polymarket.clob_client import get_market_books
+            books = get_market_books(pm_full)
+            if books:
+                yes_book, no_book = books
+                poly_market_slim["yes_top_ask_size"] = yes_book.top_ask.size if yes_book.top_ask else None
+                poly_market_slim["no_top_ask_size"] = no_book.top_ask.size if no_book.top_ask else None
+        except Exception:
+            pass
+
         row = {
             "poly_id": c["poly_id"],
             "poly_question": c["poly_question"],
+            "poly_market": poly_market_slim,
             "kalshi_ticker": c["kalshi_ticker"],
             "kalshi_title": c["kalshi_title"],
+            "kalshi_market": c.get("kalshi_market"),
             "similarity": c["similarity"],
             "verification": v,
             "threshold_check": reason,
+            "p_yes_ask_size": poly_market_slim.get("yes_top_ask_size"),
+            "p_no_ask_size": poly_market_slim.get("no_top_ask_size"),
             **arb,
         }
         matches.append(row)
