@@ -83,6 +83,53 @@ class InMemoryBackend:
         return new
 
 
+class RedisBackend:
+    """Redis-backed state for live trading. Survives process restarts.
+
+    Each operation maps to a single Redis command so concurrent traders
+    can't corrupt state. Uses redis.asyncio for native async I/O.
+
+    Construct with a `redis.asyncio.Redis` client (or pass `url=` and
+    we'll build one for you).
+    """
+
+    def __init__(self, client=None, url: str | None = None):
+        if client is None:
+            import redis.asyncio as aioredis
+            url = url or "redis://localhost:6379/0"
+            client = aioredis.from_url(url, decode_responses=True)
+        self._r = client
+
+    async def get(self, key: str) -> str | None:
+        return await self._r.get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        await self._r.set(key, value)
+
+    async def hget(self, key: str, field: str) -> str | None:
+        return await self._r.hget(key, field)
+
+    async def hset(self, key: str, field: str, value: str) -> None:
+        await self._r.hset(key, field, value)
+
+    async def hdel(self, key: str, field: str) -> None:
+        await self._r.hdel(key, field)
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        return await self._r.hgetall(key) or {}
+
+    async def xadd(self, key: str, fields: dict[str, str]) -> None:
+        # Cap stream length to avoid unbounded growth (~10k events per stream)
+        await self._r.xadd(key, fields, maxlen=10_000, approximate=True)
+
+    async def incrbyfloat(self, key: str, amount: float) -> float:
+        return float(await self._r.incrbyfloat(key, amount))
+
+    async def aclose(self) -> None:
+        if hasattr(self._r, "aclose"):
+            await self._r.aclose()
+
+
 class PortfolioState:
     """High-level portfolio operations. Backend-agnostic."""
 
@@ -190,13 +237,16 @@ class PortfolioState:
         cost = fill.contracts * fill.price + fill.fee
         await self.backend.incrbyfloat(self._k("cash"), -cost)
 
-        # Position: open or update with side-aware avg_cost
+        # Position: open or update with side-aware avg_cost.
+        # total_fees accumulates entry fees so settle() can subtract them from
+        # realized PnL — without this, the kill switch reads a fee-blind ledger.
         existing_raw = await self.backend.hget(self._k("positions"), fill.ticker)
         if existing_raw is None:
             new_pos = Position(
                 ticker=fill.ticker, side=fill.side,
                 contracts=fill.contracts, avg_cost=fill.price,
                 opened_at=fill.timestamp, last_updated=fill.timestamp,
+                total_fees=fill.fee,
             )
             await self.backend.hset(self._k("positions"), fill.ticker, new_pos.model_dump_json())
         else:
@@ -212,6 +262,7 @@ class PortfolioState:
                 "contracts": total_contracts,
                 "avg_cost": new_avg,
                 "last_updated": fill.timestamp,
+                "total_fees": pos.total_fees + fill.fee,
             })
             await self.backend.hset(self._k("positions"), fill.ticker, updated.model_dump_json())
 
@@ -229,11 +280,21 @@ class PortfolioState:
         Fee is charged once on the entire fill, not per contract.
         """
         closing = min(pos.contracts, fill.contracts)
+        leftover_fill = fill.contracts - closing
+        remaining_existing = pos.contracts - closing
+
         # Realized P&L: closing the existing side at the implied "sell" price.
         # Buying NO at fill.price is mathematically the same as selling the YES
         # side at (1 - fill.price), and vice versa.
+        # Fees split proportionally:
+        #   - closing-side fee: fill.fee × closing / fill.contracts (charged on the close portion)
+        #   - leftover-side fee: the rest, attached to the new opposite-side position
+        #   - closed entry fee: pos.total_fees × closing / pos.contracts (entry fees on closed contracts)
         equivalent_sell_price = 1.0 - fill.price
-        pnl = closing * (equivalent_sell_price - pos.avg_cost) - fill.fee
+        closing_side_fee = fill.fee * closing / fill.contracts if fill.contracts else 0.0
+        leftover_side_fee = fill.fee - closing_side_fee
+        closed_entry_fee = pos.total_fees * closing / pos.contracts if pos.contracts else 0.0
+        pnl = closing * (equivalent_sell_price - pos.avg_cost) - closing_side_fee - closed_entry_fee
         await self.backend.incrbyfloat(self._k("realized_pnl"), pnl)
         await self.backend.incrbyfloat(self._daily_pnl_key(fill.timestamp), pnl)
 
@@ -242,14 +303,15 @@ class PortfolioState:
         # position. The net cash debit on the closing portion is exactly the
         # realized PnL (already in cash via the apply_fill caller's debit).
 
-        remaining_existing = pos.contracts - closing
-        leftover_fill = fill.contracts - closing
+        remaining_entry_fees = pos.total_fees - closed_entry_fee
 
         if remaining_existing > 0:
-            # Case 1: existing side reduced, no new position
+            # Case 1: existing side reduced, no new position. Carry the
+            # remaining proportional entry fees forward.
             updated = pos.model_copy(update={
                 "contracts": remaining_existing,
                 "last_updated": fill.timestamp,
+                "total_fees": remaining_entry_fees,
             })
             await self.backend.hset(self._k("positions"), fill.ticker,
                                     updated.model_dump_json())
@@ -258,19 +320,23 @@ class PortfolioState:
             await self.backend.hdel(self._k("positions"), fill.ticker)
             if leftover_fill > 0:
                 # Case 3: open a new position on the OPPOSITE side with the
-                # leftover contracts at the fill price. avg_cost = fill.price.
+                # leftover contracts at the fill price. The leftover portion's
+                # share of fill.fee follows the contracts onto the new position.
                 new_pos = Position(
                     ticker=fill.ticker, side=fill.side,
                     contracts=leftover_fill, avg_cost=fill.price,
                     opened_at=fill.timestamp, last_updated=fill.timestamp,
+                    total_fees=leftover_side_fee,
                 )
                 await self.backend.hset(self._k("positions"), fill.ticker,
                                         new_pos.model_dump_json())
 
     async def settle(self, ticker: str, settlement_value: float, t: datetime) -> float:
         """Resolve a position: contracts × settlement_value goes to cash;
-        realized P&L = (settlement_value - avg_cost) * contracts on the held side.
-        Returns realized P&L for this settlement."""
+        realized P&L = (settlement_value - avg_cost) * contracts - total_fees.
+        Subtracting entry fees here is what makes the kill switch fee-aware:
+        without it, realized_pnl overstates by the cumulative fee total.
+        Returns realized P&L for this settlement (post-fee)."""
         existing_raw = await self.backend.hget(self._k("positions"), ticker)
         if existing_raw is None:
             return 0.0
@@ -280,7 +346,7 @@ class PortfolioState:
         # No-side: payoff = (1 - settlement_value) per contract
         per_contract_payoff = settlement_value if pos.side == "yes" else (1.0 - settlement_value)
         proceeds = pos.contracts * per_contract_payoff
-        pnl = pos.contracts * (per_contract_payoff - pos.avg_cost)
+        pnl = pos.contracts * (per_contract_payoff - pos.avg_cost) - pos.total_fees
 
         await self.backend.incrbyfloat(self._k("cash"), proceeds)
         await self.backend.incrbyfloat(self._k("realized_pnl"), pnl)

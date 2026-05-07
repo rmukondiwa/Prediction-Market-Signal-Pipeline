@@ -59,7 +59,6 @@ def _parse_args() -> argparse.Namespace:
 
 async def main(max_markets: int | None = None, no_filter: bool = False, skip_fetch: bool = False) -> None:
     load_dotenv()
-    config = KalshiConfig()
 
     # Stage 1: fetch catalog (or reuse existing)
     if skip_fetch:
@@ -67,6 +66,9 @@ async def main(max_markets: int | None = None, no_filter: bool = False, skip_fet
         logger.info("Skipping fetch — loading existing catalog from disk")
         markets = load_catalog()
     else:
+        # KalshiConfig requires KALSHI_API_KEY_ID + private key — only load
+        # it when we're actually about to call the Kalshi API.
+        config = KalshiConfig()
         logger.info("Fetching market catalog from Kalshi API")
         markets = await build_catalog(config.rest_base_url)
 
@@ -94,12 +96,20 @@ async def main(max_markets: int | None = None, no_filter: bool = False, skip_fet
     save_catalog(markets)
     logger.info("Catalog saved", extra={"count": len(markets)})
 
-    # Stage 2: embed
+    # Stage 2: embed (provider auto-detected from OPENAI_BASE_URL — Gemini compat
+    # endpoint uses gemini-embedding-001 with 512 dims; native OpenAI uses
+    # text-embedding-3-small. Both produce 512-dim vectors so the FAISS index
+    # is provider-agnostic at the storage level.)
     logger.info("Building embedding inputs")
     texts = build_embedding_inputs(markets)
 
-    logger.info("Embedding markets via OpenAI", extra={"total": len(texts)})
-    embeddings = embed_texts(texts)
+    import os as _os
+    _provider = "Gemini" if "generativelanguage.googleapis.com" in _os.getenv("OPENAI_BASE_URL", "") else "OpenAI"
+    logger.info(f"Embedding markets via {_provider}", extra={"total": len(texts)})
+    # Gemini free tier is 15 RPM at the embedding endpoint — at batch_size=100
+    # that's 100 texts per request, so a 4s pause between batches stays under.
+    delay = 4.0 if _provider == "Gemini" else 0.0
+    embeddings = embed_texts(texts, rate_limit_delay_s=delay)
 
     # Stage 3: build and save FAISS index
     logger.info("Building FAISS index")

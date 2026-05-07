@@ -18,6 +18,8 @@ class Position(BaseModel):
     avg_cost: float  # mean price per contract (in dollars, 0..1)
     opened_at: datetime
     last_updated: datetime
+    total_fees: float = 0.0  # cumulative entry fees on this position; defaults to 0
+                             # for back-compat with pre-fee-tracking serialized state
 
 
 class WorkingOrder(BaseModel):

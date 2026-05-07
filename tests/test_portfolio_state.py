@@ -201,6 +201,46 @@ async def test_snapshot_aggregates_state(state):
     assert abs(snap.unrealized_pnl - 2.0) < 1e-9
 
 
+async def test_settle_subtracts_entry_fees(state):
+    """REGRESSION: kill switch was fee-blind because settle() ignored entry fees.
+    With the fix, realized_pnl reflects actual ledger including fees."""
+    await state.initialize(1_000.0)
+    await state.apply_fill(Fill(
+        fill_id="f1", order_id=None, ticker="X-1", side="yes",
+        contracts=100, price=0.85, fee=0.89,  # realistic Kalshi fee at p=0.85
+        timestamp=datetime.now(timezone.utc), signal_model="m1",
+    ))
+    pnl = await state.settle("X-1", settlement_value=1.0, t=datetime.now(timezone.utc))
+    # Gross PnL: 100 × (1.0 - 0.85) = 15.0; minus entry fee 0.89 → 14.11
+    assert abs(pnl - 14.11) < 1e-6, f"expected $14.11 net, got ${pnl:.4f}"
+    assert abs(await state.get_realized_pnl() - 14.11) < 1e-6
+
+
+async def test_partial_close_proportionally_allocates_entry_fees(state):
+    """When 50% of a position closes via opposite-side fill, 50% of entry fees
+    should be charged against the close PnL; the rest carries forward."""
+    await state.initialize(10_000.0)
+    base = datetime.now(timezone.utc)
+    await state.apply_fill(Fill(
+        fill_id="f1", order_id=None, ticker="X-1", side="yes",
+        contracts=100, price=0.50, fee=2.00,
+        timestamp=base, signal_model="m1",
+    ))
+    # Buy 30 NO at 0.50 (equiv sell yes at 0.50) — closes 30 yes, no leftover.
+    # Closed entry fee: 2.00 × 30/100 = 0.60. Closing-side fee: 0.10 × 30/30 = 0.10.
+    await state.apply_fill(Fill(
+        fill_id="f2", order_id=None, ticker="X-1", side="no",
+        contracts=30, price=0.50, fee=0.10,
+        timestamp=base, signal_model="m2",
+    ))
+    # Realized PnL: 30 × (0.50 - 0.50) - 0.10 - 0.60 = -0.70
+    assert abs(await state.get_realized_pnl() - (-0.70)) < 1e-6
+    # Remaining position: 70ct, total_fees should be 2.00 - 0.60 = 1.40
+    pos = await state.get_position("X-1")
+    assert pos.contracts == 70
+    assert abs(pos.total_fees - 1.40) < 1e-6
+
+
 async def test_namespace_isolation_between_envs():
     backend = InMemoryBackend()
     paper = PortfolioState(backend, env="paper")

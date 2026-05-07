@@ -8,4 +8,16 @@ keys/
 data/archive/
 data/backtest_cache/
 data/calibration_map.pkl
+data/calibration_pairs.jsonl
+data/catalog.json
+data/decay_*
+data/expanded_*
+data/hf_*
+data/vectors.faiss
+data/vectors_meta.json
+data/vectors_openai.*.bak
+data/vectors_meta_openai.*.bak
 reports/
+logs/
+# Strategy archive — directional/research work, not part of arb infra
+experiments/

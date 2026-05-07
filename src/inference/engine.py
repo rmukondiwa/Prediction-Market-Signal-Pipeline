@@ -2,11 +2,16 @@
 Structured inference engine.
 
 Hot-path stage 4: takes a focus market snapshot + causal context markets,
-sends a structured reasoning prompt to Groq, and returns a fully populated
-InferenceReport with mispricings and quarter-Kelly position sizes.
+sends a structured reasoning prompt to the configured LLM provider, and
+returns a fully populated InferenceReport with mispricings and quarter-Kelly
+position sizes.
+
+Provider selection: auto-detects Gemini's OpenAI-compatible endpoint via
+`OPENAI_BASE_URL` env var. Override per-call with `model=...` kwarg.
 """
 
 import json
+import os
 from typing import TYPE_CHECKING
 
 from openai import OpenAI
@@ -26,7 +31,13 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_MODEL = "gpt-4o"
+
+def _default_model() -> str:
+    base = os.getenv("OPENAI_BASE_URL", "")
+    return "gemini-2.0-flash" if "generativelanguage.googleapis.com" in base else "gpt-4o"
+
+
+_MODEL = _default_model()
 
 # Bumped on prompt changes — included in cache key so old entries naturally expire.
 PROMPT_VERSION = "v1"
