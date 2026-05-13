@@ -23,6 +23,7 @@ import asyncio
 import datetime as dt
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 LOG = Path("logs/scanner_hits.jsonl")
@@ -41,7 +42,7 @@ def run_alpha_scanner() -> dict:
     """Run scan_alpha.py and parse its JSON output."""
     rpt = Path("reports/alpha.json")
     proc = subprocess.run(
-        [".venv/bin/python", "-m", "scripts.scan_alpha", "--output", str(rpt)],
+        [sys.executable, "-m", "scripts.scan_alpha", "--output", str(rpt)],
         capture_output=True, timeout=120,
     )
     record = {
@@ -69,7 +70,7 @@ def run_xplatform_scanner() -> dict:
     """Run scan_cross_platform_arb.py and parse its JSON output."""
     rpt = Path("reports/cross_platform_arb.json")
     proc = subprocess.run(
-        [".venv/bin/python", "-m", "scripts.scan_cross_platform_arb",
+        [sys.executable, "-m", "scripts.scan_cross_platform_arb",
          "--output", str(rpt)],
         capture_output=True, timeout=180,
     )

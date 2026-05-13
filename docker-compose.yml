@@ -1,0 +1,56 @@
+x-app: &app
+  build: .
+  image: pmsp:latest
+  env_file: .env
+  volumes:
+    - ./data:/app/data
+    - ./logs:/app/logs
+    - ./reports:/app/reports
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    profiles: [core, trading, all]
+
+  # ── Always-on services ─────────────────────────────────────────────────────
+
+  ingestion:
+    <<: *app
+    command: python3 main.py
+    restart: unless-stopped
+    depends_on:
+      - redis
+    profiles: [core, all]
+
+  scanners:
+    <<: *app
+    command: python3 -m scripts.run_scanners_loop
+    restart: unless-stopped
+    depends_on:
+      - redis
+    profiles: [trading, all]
+
+  # ── Scheduled jobs ─────────────────────────────────────────────────────────
+
+  scheduler:
+    <<: *app
+    entrypoint: ["/app/docker/scheduler-entrypoint.sh"]
+    restart: unless-stopped
+    profiles: [infra, all]
+
+  # ── On-demand ──────────────────────────────────────────────────────────────
+  # Run with: docker compose run --rm infer TICKER [--no-redis] [--dry-run]
+
+  infer:
+    <<: *app
+    entrypoint: ["python3", "infer.py"]
+    profiles: [tools]
+
+volumes:
+  redis_data:
