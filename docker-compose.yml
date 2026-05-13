@@ -1,13 +1,25 @@
 x-app: &app
-  build: .
   image: pmsp:latest
   env_file: .env
   volumes:
     - ./data:/app/data
     - ./logs:/app/logs
     - ./reports:/app/reports
+    - ./keys:/app/keys:ro
 
 services:
+
+  # ── Build target (no profile — `docker compose build` always works) ─────────
+
+  app:
+    build: .
+    image: pmsp:latest
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      - ./keys:/app/keys:ro
 
   # ── Infrastructure ─────────────────────────────────────────────────────────
 
