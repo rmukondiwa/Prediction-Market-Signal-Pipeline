@@ -1,1 +1,1 @@
-0 6 * * * cd /app && python3 -m scripts.build_index >> /app/logs/build_index.log 2>&1
+0 6 * * * . /app/.cron-env && cd /app && python3 -m scripts.build_index >> /app/logs/build_index.log 2>&1
