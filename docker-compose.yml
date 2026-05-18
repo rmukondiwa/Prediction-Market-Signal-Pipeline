@@ -48,6 +48,12 @@ services:
       - redis
     profiles: [trading, all]
 
+  live-book-scanner:
+    <<: *app
+    command: python3 -m scripts.scan_live_book
+    restart: unless-stopped
+    profiles: [trading, all]
+
   # ── Scheduled jobs ─────────────────────────────────────────────────────────
 
   scheduler:
