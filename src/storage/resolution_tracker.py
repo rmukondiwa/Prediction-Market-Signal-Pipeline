@@ -103,7 +103,7 @@ async def _fetch_market(
 ) -> dict | None:
     async def _do() -> dict:
         async with semaphore:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
             async with session.get(f"{base_url}/markets/{ticker}") as resp:
                 if resp.status == 404:
                     return {}
@@ -122,7 +122,7 @@ async def track_resolutions(
     base_url: str,
     tickers: list[str],
     archive_root: Path = Path("data/archive"),
-    concurrency: int = 8,
+    concurrency: int = 4,
 ) -> list[ResolutionRecord]:
     """
     For each ticker, fetch its latest market state. Skip those already at a
