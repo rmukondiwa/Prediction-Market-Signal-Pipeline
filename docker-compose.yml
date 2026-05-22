@@ -54,6 +54,14 @@ services:
     restart: unless-stopped
     profiles: [trading, all]
 
+  paper-trader:
+    <<: *app
+    command: python3 -m scripts.paper_trade --signal-model raw_llm --interval 1h
+    restart: unless-stopped
+    depends_on:
+      - redis
+    profiles: [trading, all]
+
   # ── Scheduled jobs ─────────────────────────────────────────────────────────
 
   scheduler:
