@@ -37,6 +37,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--from-catalog", type=Path, help="Read tickers from catalog.json")
     p.add_argument("--settled", action="store_true",
                    help="Fetch settled markets directly from Kalshi API (fastest, no rate limit issues)")
+    p.add_argument("--max-settled", type=int, default=5000,
+                   help="Max settled markets to fetch with --settled (default: 5000)")
     p.add_argument("--archive-root", type=Path, default=Path("data/archive"))
     p.add_argument("--concurrency", type=int, default=4,
                    help="Max concurrent API requests (default: 4, ~16 req/s)")
@@ -54,7 +56,7 @@ async def main() -> None:
     tickers: list[str] = []
     if args.settled:
         logger.info("Fetching settled markets directly from Kalshi API")
-        markets = await fetch_settled_markets(cfg.rest_base_url)
+        markets = await fetch_settled_markets(cfg.rest_base_url, max_markets=args.max_settled)
         tickers = [m["ticker"] for m in markets]
         logger.info("Settled markets fetched", extra={"count": len(tickers)})
     elif args.tickers:

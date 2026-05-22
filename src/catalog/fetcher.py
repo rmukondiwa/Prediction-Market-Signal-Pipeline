@@ -61,11 +61,11 @@ async def fetch_all_markets(base_url: str, max_markets: int | None = None) -> li
     return markets
 
 
-async def fetch_settled_markets(base_url: str) -> list[dict]:
+async def fetch_settled_markets(base_url: str, max_markets: int = 5000) -> list[dict]:
     """
-    Paginate GET /markets?status=settled&limit=1000 until cursor is exhausted.
-    Returns only resolved markets — far fewer API calls than checking each
-    active market individually for settlement status.
+    Paginate GET /markets?status=settled&limit=1000.
+    Stops after max_markets (default 5000) — Kalshi has 400k+ settled markets,
+    fetching all is unnecessary for backtesting.
     """
     markets: list[dict] = []
     cursor: str | None = None
@@ -91,9 +91,10 @@ async def fetch_settled_markets(base_url: str) -> list[dict]:
                 extra={"count": len(batch), "total_so_far": len(markets)},
             )
 
-            if not cursor:
+            if not cursor or len(markets) >= max_markets:
                 break
 
+    markets = markets[:max_markets]
     logger.info("Finished fetching settled markets", extra={"total": len(markets)})
     return markets
 
