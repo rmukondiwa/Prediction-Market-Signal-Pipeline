@@ -284,9 +284,12 @@ def run_signals(report: InferenceReport,
 
 async def main_async(args):
     load_dotenv()
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise SystemExit("Set GEMINI_API_KEY or OPENAI_API_KEY")
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        raise SystemExit("Set OPENAI_API_KEY")
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        raise SystemExit("Set GEMINI_API_KEY")
 
     print("=== End-to-end LLM signal edge measurement ===")
 
@@ -295,7 +298,7 @@ async def main_async(args):
     if not rows_path.exists():
         raise SystemExit(f"Missing {rows_path}")
     rows = [m for m in json.load(open(rows_path))
-            if m.get("status") == "finalized" and m.get("result") in ("yes", "no")]
+            if m.get("status") in ("finalized", "settled") and m.get("result") in ("yes", "no")]
     random.seed(args.seed)
     sample = random.sample(rows, min(args.n, len(rows)))
     print(f"  Pool: {len(rows)} resolved, sampled {len(sample)}")
@@ -303,23 +306,32 @@ async def main_async(args):
     print(f"  Loading FAISS index...")
     vs = VectorStore()
     vs.load()
-    embed_client = OpenAI(api_key=api_key,
-                           base_url=os.environ.get("OPENAI_BASE_URL"))
+    embed_client = OpenAI(api_key=openai_key)
 
     signals = {
         "raw_llm": RawLLMSignal(),
-        "calibrated_llm": CalibratedLLMSignal("data/calibration_map.pkl"),
         "consistency_arb": ConsistencyArbSignal(),
         "bayesian_base_rate": BayesianBaseRateSignal(),
         "coherence_regression": CoherenceRegressionSignal(),
     }
-    hist = HistoricalContext()
+    _cal_path = Path("data/calibration_map.pkl")
+    if _cal_path.exists():
+        signals["calibrated_llm"] = CalibratedLLMSignal(str(_cal_path))
+    else:
+        print(f"  Skipping calibrated_llm — no calibration map yet (run fit_calibration after this)")
+
+    # Load resolutions into HistoricalContext so bayesian_base_rate can find analogues
+    from src.storage.resolution_tracker import load_resolutions
+    archive_root = Path("data/archive")
+    resolutions = load_resolutions(archive_root)
+    hist = HistoricalContext(resolutions=resolutions)
+    print(f"  Loaded {len(resolutions)} resolution records into HistoricalContext")
 
     # Embed all focus titles in one batch (cheap)
     print(f"  Embedding {len(sample)} focus titles...")
     titles = [m.get("title", "") for m in sample]
     embed_resp = embed_client.embeddings.create(
-        model="gemini-embedding-001", input=titles, dimensions=512,
+        model="text-embedding-3-small", input=titles, dimensions=512,
     )
     focus_vecs = [d.embedding for d in embed_resp.data]
 
@@ -334,27 +346,13 @@ async def main_async(args):
     # Call inference engine for each — concurrent with rate-limit retry
     print(f"  Running Gemini inference on {len(pairs)} markets (concurrency={args.concurrency})...")
     sem = asyncio.Semaphore(args.concurrency)
-    results = []
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            gemini_inference(session, api_key, args.model, snap, ctx, sem)
-            for _, snap, ctx in pairs
-        ]
-        for i, fut in enumerate(asyncio.as_completed(tasks), 1):
-            r = await fut
-            results.append(r)
-            if i % 5 == 0:
-                ok = sum(1 for x in results if "error" not in x)
-                print(f"    {i}/{len(pairs)} done ({ok} valid)", flush=True)
-
-    # Reorder results to match pairs order (asyncio.as_completed loses ordering)
-    # → Re-run as gather to preserve order
-    print(f"  (re-aligning results — using gather)")
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*[
-            gemini_inference(session, api_key, args.model, snap, ctx, sem)
+            gemini_inference(session, gemini_key, args.model, snap, ctx, sem)
             for _, snap, ctx in pairs
         ])
+    ok = sum(1 for x in results if "error" not in x)
+    print(f"    {len(pairs)}/{len(pairs)} done ({ok} valid)", flush=True)
 
     # Score each
     per_signal: dict = defaultdict(lambda: {
