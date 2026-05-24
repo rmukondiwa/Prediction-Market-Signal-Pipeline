@@ -61,6 +61,44 @@ async def fetch_all_markets(base_url: str, max_markets: int | None = None) -> li
     return markets
 
 
+async def fetch_settled_markets(base_url: str, max_markets: int = 5000) -> list[dict]:
+    """
+    Paginate GET /markets?status=settled&limit=1000.
+    Stops after max_markets (default 5000) — Kalshi has 400k+ settled markets,
+    fetching all is unnecessary for backtesting.
+    """
+    markets: list[dict] = []
+    cursor: str | None = None
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            params: dict = {"status": "settled", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+
+            async def _fetch(session=session, params=params):
+                async with session.get(f"{base_url}/markets", params=params) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+
+            data = await retry_with_backoff(_fetch, label="fetch_settled_markets page")
+            batch = data.get("markets", [])
+            markets.extend(batch)
+
+            cursor = data.get("cursor", "")
+            logger.info(
+                "Fetched settled market page",
+                extra={"count": len(batch), "total_so_far": len(markets)},
+            )
+
+            if not cursor or len(markets) >= max_markets:
+                break
+
+    markets = markets[:max_markets]
+    logger.info("Finished fetching settled markets", extra={"total": len(markets)})
+    return markets
+
+
 async def fetch_event(
     session: aiohttp.ClientSession,
     base_url: str,
