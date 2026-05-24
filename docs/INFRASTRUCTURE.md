@@ -326,4 +326,6 @@ BACKTEST_PROMPT_VERSION=v1
 | [STRATEGY_FINDINGS.md](STRATEGY_FINDINGS.md) | What we built + learned + bugs found in session |
 | [STRATEGIES.md](STRATEGIES.md) | Catalog of every strategy: built / researched / future |
 | [INFRASTRUCTURE.md](INFRASTRUCTURE.md) | This doc — code/data/scripts/APIs reference |
+| [DOCKER.md](DOCKER.md) | Container layout, profiles, one-off commands |
+| [EC2_DEPLOYMENT.md](EC2_DEPLOYMENT.md) | Cloud host: SSH access, services, updating, gotchas |
 | `CLAUDE.md` (root) | Project instructions for Claude (codebase conventions) |
