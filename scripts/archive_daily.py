@@ -35,6 +35,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-streams", action="store_true")
     parser.add_argument("--skip-catalog", action="store_true")
     parser.add_argument("--skip-resolutions", action="store_true")
+    parser.add_argument("--max-markets", type=int, default=25000,
+                        help="Cap markets fetched for catalog snapshot (default: 25000)")
     return parser.parse_args()
 
 
@@ -53,7 +55,8 @@ async def main() -> None:
     if not args.skip_catalog:
         try:
             kalshi_cfg = KalshiConfig()
-            path = await snapshot_catalog(kalshi_cfg.rest_base_url, args.archive_root)
+            path = await snapshot_catalog(kalshi_cfg.rest_base_url, args.archive_root,
+                                          max_markets=args.max_markets)
             from src.storage.catalog_archive import load_catalog_parquet
             catalog_tickers = [m.ticker for m in load_catalog_parquet(path)]
         except Exception as exc:
