@@ -54,9 +54,11 @@ async def fetch_all_markets(base_url: str, max_markets: int | None = None) -> li
                 extra={"count": len(batch), "total_so_far": len(markets)},
             )
 
-            if not cursor:
+            if not cursor or (max_markets and len(markets) >= max_markets):
                 break
 
+    if max_markets:
+        markets = markets[:max_markets]
     logger.info("Finished fetching all markets", extra={"total": len(markets)})
     return markets
 
